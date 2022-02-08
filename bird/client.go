@@ -18,7 +18,7 @@ type SocketClient struct {
 	con     net.Conn
 }
 
-func NewSocketClient(socketPath string, bufferSize int) (*SocketClient, error) {
+func NewSocketClient(socketPath string) (*SocketClient, error) {
 	con, err := net.Dial("unix", socketPath)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to connect to bird socket")

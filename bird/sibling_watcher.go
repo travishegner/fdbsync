@@ -14,6 +14,7 @@ type SiblingWatcher struct {
 	client   Client
 	interval time.Duration
 	state    map[string]map[string]struct{}
+	dones    map[string]chan struct{}
 }
 
 type SiblingUpdate struct {
@@ -30,11 +31,18 @@ func NewSiblingWatcher(client Client, interval time.Duration) *SiblingWatcher {
 	}
 }
 
-func (sw *SiblingWatcher) Watch(prefix *net.IPNet, ch chan *SiblingUpdate, done chan struct{}) {
-	go sw.watch(prefix, ch, done)
+func (sw *SiblingWatcher) Watch(prefix *net.IPNet, ch chan *SiblingUpdate) {
+	sw.dones[prefix.String()] = make(chan struct{})
+	go sw.watch(prefix, ch)
 }
 
-func (sw *SiblingWatcher) watch(prefix *net.IPNet, ch chan *SiblingUpdate, done chan struct{}) {
+func (sw *SiblingWatcher) StopWatch(prefix *net.IPNet) {
+	if ch, ok := sw.dones[prefix.String()]; ok {
+		close(ch)
+	}
+}
+
+func (sw *SiblingWatcher) watch(prefix *net.IPNet, ch chan *SiblingUpdate) {
 	timer := time.NewTimer(sw.interval)
 
 	for {
@@ -42,13 +50,15 @@ func (sw *SiblingWatcher) watch(prefix *net.IPNet, ch chan *SiblingUpdate, done 
 		case <-timer.C:
 			updates, err := sw.reconcile(prefix)
 			if err != nil {
-				log.Fatalf("error watching bird: %v", err)
+				log.Printf("error while watching bird: %v\n", err)
+				log.Printf("state may be out of sync\n")
 			}
 			for _, update := range updates {
 				ch <- update
 			}
-		case <-done:
-			log.Println("done channel closed")
+		case <-sw.dones[prefix.String()]:
+			log.Printf("done channel closed for prefix %v\n", prefix)
+			close(ch)
 			return
 		}
 	}

@@ -73,21 +73,3 @@ func vxlanIDFromPrefix(prefix *net.IPNet) (int, error) {
 
 	return -1, errors.New(fmt.Sprintf("failed to get device route for %v\n", prefix))
 }
-
-func firstContainerNetworkFromLink(link netlink.Link, cnet *net.IPNet) (*net.IPNet, error) {
-	addrs, err := netlink.AddrList(link, netlink.FAMILY_ALL)
-	if err != nil {
-		return nil, errors.New(fmt.Sprintf("failed to get addresses for %v\n", link.Attrs().Name))
-	}
-
-	var prefix *net.IPNet
-	for _, addr := range addrs {
-		if !cnet.Contains(addr.IP) {
-			continue
-		}
-		_, prefix, _ = net.ParseCIDR(addr.IPNet.String())
-		return prefix, nil
-	}
-
-	return nil, errors.New(fmt.Sprintf("failed to find container network for %v\n", link.Attrs().Name))
-}

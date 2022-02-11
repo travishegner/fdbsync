@@ -7,17 +7,14 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
-	"github.com/travishegner/fdbsync/bird"
 	"github.com/vishvananda/netlink"
 )
 
 const (
-	birdSocket    = "/var/run/bird/bird.ctl"
-	birdInterval  = 5 * time.Second
-	containerCIDR = "10.1.0.0/16"
-	linkGlob      = "mv_*"
+	linkGlob            = "vx_*"
+	containerCIDR       = "10.1.0.0/16"
+	defaultSiblingTable = 193
 )
 
 func main() {
@@ -26,139 +23,100 @@ func main() {
 
 	done := make(chan struct{})
 	addrUpdates := make(chan netlink.AddrUpdate, 1024)
-	siblingUpdates := make(chan *SiblingUpdate, 1024)
+	routeUpdates := make(chan netlink.RouteUpdate, 1024)
 
 	err := netlink.AddrSubscribe(addrUpdates, done)
 	if err != nil {
-		log.Fatalf("failed to subscribe to route changes: %v", err)
+		log.Fatalf("failed to suscribe to addr changes: %v\n", err)
 	}
 
-	watchers := make(map[string]*SiblingWatcher)
+	err = netlink.RouteSubscribe(routeUpdates, done)
+	if err != nil {
+		log.Fatalf("failed to subscribe to route changes: %v\n", err)
+	}
 
 	_, cnet, err := net.ParseCIDR(containerCIDR)
 	if err != nil {
-		log.Fatalf("failed to parse container CIDR: %v\n", containerCIDR)
+		log.Fatalf("failed to parse %v as container cidr: %v", containerCIDR, err)
 	}
 
 	addrs, err := netlink.AddrList(nil, netlink.FAMILY_ALL)
 	if err != nil {
-		log.Fatalf("failed to get system link list")
+		log.Fatalf("failed to get address list")
 	}
 
 	for _, addr := range addrs {
 		if !cnet.Contains(addr.IP) {
 			continue
 		}
-
 		_, prefix, _ := net.ParseCIDR(addr.IPNet.String())
-
-		c, err := bird.NewSocketClient(birdSocket)
+		err = syncFDB(prefix)
 		if err != nil {
-			log.Printf("failed to create new socket client for: %v\n", prefix)
-			log.Printf("error: %v\n", err)
-			continue
+			log.Fatalf("failed to do initial fdb sync: %v\n", err)
 		}
-		w := NewSiblingWatcher(
-			birdInterval,
-			c,
-			prefix,
-			siblingUpdates,
-		)
-
-		w.Watch()
-		watchers[prefix.String()] = w
 	}
 
 Control:
 	for {
 		select {
 		case au := <-addrUpdates:
+			if !au.NewAddr {
+				//only care about new addresses
+				continue
+			}
+
 			if !cnet.Contains(au.LinkAddress.IP) {
+				//only care about container networks
 				continue
 			}
 
 			_, prefix, _ := net.ParseCIDR(au.LinkAddress.String())
+			log.Printf("link added for %v\n", prefix)
 
-			if !au.NewAddr {
-				fmt.Printf("addr %v deleted\n", au.LinkAddress)
-
-				//an overlay network was detached, stop and delete it's watcher
-				w, ok := watchers[prefix.String()]
-				if !ok {
-					fmt.Printf("no watcher found for %v\n", prefix)
-					continue
-				}
-				fmt.Printf("stopping watcher for %v\n", prefix)
-				w.Stop()
-				delete(watchers, prefix.String())
-
-				continue
-			}
-
-			_, ok := watchers[prefix.String()]
-			if ok {
-				fmt.Printf("duplicate watcher found for %v refusing to start another one\n", prefix)
-				continue
-			}
-
-			//a new overlay network attached, create and start a new watcher
-			c, err := bird.NewSocketClient(birdSocket)
+			err := syncFDB(prefix)
 			if err != nil {
-				log.Printf("failed to create new socket client for %v\n", prefix)
-				log.Printf("error: %v\n", err)
+				log.Printf("failed to sync fdb after address add: %v", err)
+			}
+		case ru := <-routeUpdates:
+			if ru.Table != defaultSiblingTable {
+				//not a route we care about
 				continue
 			}
-			w := NewSiblingWatcher(
-				birdInterval,
-				c,
-				prefix,
-				siblingUpdates,
-			)
-			watchers[prefix.String()] = w
 
-			log.Printf("starting watcher for %v\n", prefix)
-			w.Watch()
-		case su := <-siblingUpdates:
-			if su.Added {
-				//detected a new sibling connected to an overlay
-				log.Printf("adding sibling %v to fdb for %v", su.Sibling, su.Prefix)
-				err := addSibling(su.Prefix, su.Sibling)
+			dc, err := isDirectlyConnected(ru.Dst)
+			if err != nil {
+				log.Printf("error checking if local route: %v\n", err)
+			}
+			if !dc {
+				//not a route we care about
+				continue
+			}
+
+			switch ru.Type {
+			case syscall.RTM_NEWROUTE:
+				log.Printf("route added for %v\n", ru.Dst)
+				err := syncFDB(ru.Dst)
 				if err != nil {
-					log.Printf("failed to add sibling %v to forwarding database for %v\n", su.Sibling, su.Prefix)
-					log.Printf("error: %v\n", err)
+					log.Printf("failed to sync fdb after route add: %v", err)
 				}
+			case syscall.RTM_DELROUTE:
+				log.Printf("route deleted for %v\n", ru.Dst)
+				err := syncFDB(ru.Dst)
+				if err != nil {
+					log.Printf("failed to sync fdb after route del: %v", err)
+				}
+			default:
 				continue
-			}
-			//detected a sibling disconnecting from an overlay
-			log.Printf("deleting sibling %v from fdb for %v", su.Sibling, su.Prefix)
-			err := delSibling(su.Prefix, su.Sibling)
-			if err != nil {
-				log.Printf("failed to delete sibling %v from forwarding database for %v\n", su.Sibling, su.Prefix)
-				log.Printf("error: %v\n", err)
 			}
 		case s := <-sig:
 			switch s {
-			case syscall.SIGUSR1:
-				fmt.Println()
-				fmt.Println("Dumping State Tables")
-				fmt.Println("Watchers:")
-				for k := range watchers {
-					fmt.Printf("\t%v\n", k)
-				}
-				fmt.Println()
 			case syscall.SIGINT:
 				fallthrough
 			case syscall.SIGKILL:
 				fmt.Printf("received %v signal, quitting\n", s)
 				break Control
-			default:
-				continue
 			}
 		}
-	}
-
-	for _, watcher := range watchers {
-		watcher.Stop()
 	}
 
 	close(done)
